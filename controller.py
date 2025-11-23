@@ -7,18 +7,19 @@ from racetrack import RaceTrack
 DT = 0.1
 
 # --- High-level steering mapping (heading error -> desired steering angle) ---
-K_HEADING = 0.8        # slightly gentler than before
-STEER_LOOKAHEAD = 5    # look further ahead so we see sharp turns earlier
+BASE_K_HEADING = 0.6     # base heading gain
+
+STEER_LOOKAHEAD = 5      # look ahead along centerline for steering target
 
 # --- Low-level steering PD (on steering angle delta) ---
-Kp_delta = 2.0
-Ki_delta = 0.0         # keep integral off for steering (avoids windup / spinning)
-Kd_delta = 0.5
+Kp_delta = 1.8
+Ki_delta = 0.0           # keep integral off for steering
+Kd_delta = 0.9           # derivative for extra damping
 
 # --- Low-level velocity PI (on speed v) ---
 Kp_v = 0.7
 Ki_v = 0.15
-Kd_v = 0.0             # D not really needed on speed
+Kd_v = 0.0               # D not really needed on speed
 
 
 def _init_pid_state() -> None:
@@ -95,7 +96,7 @@ def controller(
     """
     High-level controller:
       - choose reference steering angle delta_r
-      - choose reference speed v_r (curvature-based)
+      - choose reference speed v_r (curvature-based, anticipatory)
 
     state = [sx, sy, delta, v, phi]
     """
@@ -119,7 +120,49 @@ def controller(
     dists   = np.linalg.norm(centerline - car_pos, axis=1)
     idx     = int(np.argmin(dists))
 
-    # ---------- 2) Steering target: look ahead a few points ----------
+    # ---------- 2) Compute curvature ahead of the car ----------
+    # Use three points (prev, curv, next) to approximate curvature.
+    idx_curv = (idx + 2) % N
+    idx_prev = (idx_curv - 1) % N
+    idx_next = (idx_curv + 1) % N
+
+    p_prev = centerline[idx_prev]
+    p0     = centerline[idx_curv]
+    p_next = centerline[idx_next]
+
+    a = np.linalg.norm(p0 - p_prev)
+    b = np.linalg.norm(p_next - p0)
+    c = np.linalg.norm(p_next - p_prev)
+
+    if a > 1e-6 and b > 1e-6 and c > 1e-6:
+        # 2 * area of triangle = |cross(p0-p_prev, p_next-p_prev)|
+        area2 = abs(np.cross(p0 - p_prev, p_next - p_prev))
+        curvature = 2.0 * area2 / (a * b * c)  # |kappa|
+    else:
+        curvature = 0.0
+
+    kappa = curvature
+
+    # ---------- 3) Curvature-based velocity reference ----------
+    # Physics-ish: v_max(curvature) ~ sqrt(a_lat_max / |kappa|)
+    v_straight   = min(v_max, 60.0)  # high speed on straights
+    v_min_corner = 6.0               # crawl in the tightest corners
+    a_lat_max    = 18.0              # "max lateral accel" (tuning knob)
+
+    if kappa < 1e-6:
+        v_curv = v_straight
+    else:
+        v_curv = np.sqrt(a_lat_max / kappa)
+
+    # clip into [v_min_corner, v_straight]
+    v_r = np.clip(v_curv, v_min_corner, v_straight)
+    v_r = np.clip(v_r, v_min, v_max)
+
+    # Build a curvature scale in [0,1] from this v_r for steering adaptation
+    curv_scale = (v_r - v_min_corner) / (v_straight - v_min_corner)
+    curv_scale = float(np.clip(curv_scale, 0.0, 1.0))
+
+    # ---------- 4) Steering target & smoothed delta_r ----------
     idx_steer = (idx + STEER_LOOKAHEAD) % N
     target    = centerline[idx_steer]
     dx        = target[0] - sx
@@ -128,43 +171,29 @@ def controller(
     phi_d = np.arctan2(dy, dx)
     e_phi = np.arctan2(np.sin(phi_d - phi), np.cos(phi_d - phi))
 
-    delta_r = K_HEADING * e_phi
+    # Adaptive heading gain: smaller in sharp corners to reduce oscillation
+    K_heading_eff = BASE_K_HEADING * (0.5 + 0.5 * curv_scale)
+    raw_delta_r   = K_heading_eff * e_phi
 
     # soften demands at very low speed so we do not instantly saturate
     if abs(v) < 1.0:
-        delta_r = np.clip(delta_r, -0.5, 0.5)
+        raw_delta_r = np.clip(raw_delta_r, -0.5, 0.5)
 
+    # Adaptive smoothing: stronger smoothing (smaller alpha) in sharp corners
+    # curv_scale ~ 1 (straight) -> alpha ~ 0.9
+    # curv_scale ~ 0 (sharp)    -> alpha ~ 0.5
+    alpha = 0.5 + 0.4 * curv_scale
+
+    if not hasattr(controller, "delta_r_prev"):
+        controller.delta_r_prev = raw_delta_r
+
+    delta_r = (1.0 - alpha) * controller.delta_r_prev + alpha * raw_delta_r
+    controller.delta_r_prev = delta_r
+
+    # Clip to physical steering limits
     delta_r = np.clip(delta_r, delta_min, delta_max)
 
-    # ---------- 3) Curvature-based velocity reference ----------
-    idx_prev = (idx - 1) % N
-    idx_next = (idx + 1) % N
-
-    seg_prev = centerline[idx]      - centerline[idx_prev]
-    seg_next = centerline[idx_next] - centerline[idx]
-
-    phi_prev = np.arctan2(seg_prev[1], seg_prev[0])
-    phi_next = np.arctan2(seg_next[1], seg_next[0])
-
-    dphi = np.arctan2(np.sin(phi_next - phi_prev), np.cos(phi_next - phi_prev))
-    dphi = abs(dphi)   # curvature proxy
-
-    # speeds
-    v_straight   = min(v_max, 50.0)  # high speed on straights
-    v_min_corner = 10.0              # low speed in very tight corners
-
-    # NEW: exponential mapping makes very sharp corners much slower
-    # dphi ≈ 0   -> curv_scale ≈ 1  (full straight speed)
-    # dphi ≈ 0.3 -> curv_scale ≈ exp(-6*0.09) ≈ 0.58
-    # dphi ≈ 0.7 -> curv_scale ≈ exp(-6*0.49) ≈ 0.05 (big slow-down)
-    curv_scale = np.exp(-6.0 * dphi * dphi)
-
-    v_r = v_min_corner + (v_straight - v_min_corner) * curv_scale
-
-    # clip within physical limits
-    v_r = np.clip(v_r, v_min, v_max)
-
-    # give a bit of push from rest so it starts moving
+    # ---------- 5) Startup nudge ----------
     if v < 1.0:
         v_r = max(v_r, 8.0)
 

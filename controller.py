@@ -1,54 +1,90 @@
 import numpy as np
 from numpy.typing import ArrayLike
 
-from racetrack import RaceTrack  # small fix: RaceTrack lives in racetrack.py
+from racetrack import RaceTrack
 
-# This should match RaceCar.time_step in racecar.py
-CONTROL_DT = 0.1  # seconds
+# Controller update period (matches RaceCar.time_step)
+DT = 0.1
 
-# Gains for the lower-level controller
-K_DELTA = 1.5     # steering P gain (on steering angle)
-K_V = 1.0         # velocity P gain (on speed)
+# --- High-level steering mapping (heading error -> desired steering angle) ---
+K_HEADING = 0.8        # slightly gentler than before
+STEER_LOOKAHEAD = 5    # look further ahead so we see sharp turns earlier
+
+# --- Low-level steering PD (on steering angle delta) ---
+Kp_delta = 2.0
+Ki_delta = 0.0         # keep integral off for steering (avoids windup / spinning)
+Kd_delta = 0.5
+
+# --- Low-level velocity PI (on speed v) ---
+Kp_v = 0.7
+Ki_v = 0.15
+Kd_v = 0.0             # D not really needed on speed
+
+
+def _init_pid_state() -> None:
+    """Lazy init of PID state so it persists across calls."""
+    if not hasattr(lower_controller, "delta_int"):
+        lower_controller.delta_int = 0.0
+        lower_controller.delta_prev_err = 0.0
+        lower_controller.v_int = 0.0
+        lower_controller.v_prev_err = 0.0
 
 
 def lower_controller(
     state: ArrayLike, desired: ArrayLike, parameters: ArrayLike
 ) -> ArrayLike:
     """
-    Lower-level controller C_v and steering-rate controller.
-    Inputs:
-      state     = [sx, sy, delta, v, phi]
-      desired   = [delta_r, v_r]
-      parameters = RaceCar.parameters (see racecar.py)
-    Output:
-      u = [steering_rate, acceleration]
+    Low-level controller: maps (state, desired) -> [steering_rate, acceleration].
+
+    state   = [sx, sy, delta, v, phi]
+    desired = [delta_r, v_r]
+    input   = [steering_rate, acceleration]
     """
+    _init_pid_state()
+
     assert state.shape == (5,)
     assert desired.shape == (2,)
     assert parameters.shape == (11,)
 
-    # Unpack state
-    delta = state[2]  # current steering angle
-    v = state[3]      # current velocity
+    delta = state[2]
+    v = state[3]
 
-    # Desired references
     delta_r = desired[0]
     v_r = desired[1]
 
-    # Wrap steering error to [-pi, pi] to avoid weird jumps
+    # ----- Steering PD (on steering angle delta) -----
     e_delta = np.arctan2(np.sin(delta_r - delta), np.cos(delta_r - delta))
+
+    lower_controller.delta_int += e_delta * DT
+    lower_controller.delta_int = np.clip(lower_controller.delta_int, -2.0, 2.0)
+
+    delta_der = (e_delta - lower_controller.delta_prev_err) / DT
+    lower_controller.delta_prev_err = e_delta
+
+    steering_rate = (
+        Kp_delta * e_delta
+        + Ki_delta * lower_controller.delta_int
+        + Kd_delta * delta_der
+    )
+
+    # ----- Velocity PI (on speed v) -----
     e_v = v_r - v
 
-    # Simple proportional controllers
-    steering_rate = K_DELTA * e_delta           # v_delta
-    acceleration = K_V * e_v                    # a
+    lower_controller.v_int += e_v * DT
+    lower_controller.v_int = np.clip(lower_controller.v_int, -50.0, 50.0)
 
-    # Input limits are enforced again in RaceCar.normalize_system, but we can
-    # optionally clip here for safety using parameters:
-    # parameters[7:9] = [min_steer_rate, min_acc]
-    # parameters[9:11] = [max_steer_rate, max_acc]
+    v_der = (e_v - lower_controller.v_prev_err) / DT
+    lower_controller.v_prev_err = e_v
+
+    acceleration = (
+        Kp_v * e_v
+        + Ki_v * lower_controller.v_int
+        + Kd_v * v_der
+    )
+
+    # Clip using parameter limits
     steering_rate = np.clip(steering_rate, parameters[7], parameters[9])
-    acceleration = np.clip(acceleration, parameters[8], parameters[10])
+    acceleration  = np.clip(acceleration,  parameters[8], parameters[10])
 
     return np.array([steering_rate, acceleration])
 
@@ -57,78 +93,79 @@ def controller(
     state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack
 ) -> ArrayLike:
     """
-    Upper-level controller S1 + velocity reference generator.
-    Computes:
-      delta_r: reference steering angle (rad)
-      v_r:     reference speed (m/s)
+    High-level controller:
+      - choose reference steering angle delta_r
+      - choose reference speed v_r (curvature-based)
 
-    Based on:
-      - nearest centerline point
-      - next centerline point for heading / velocity
+    state = [sx, sy, delta, v, phi]
     """
     assert state.shape == (5,)
     assert parameters.shape == (11,)
 
-    # Unpack state (see racecar.py and racetrack.py)
     sx, sy = state[0], state[1]
-    v = state[3]
-    phi = state[4]
+    v      = state[3]
+    phi    = state[4]
 
-    # Car / limits from parameters
-    lwb = parameters[0]        # wheelbase
     delta_min = parameters[1]
+    v_min     = parameters[2]
     delta_max = parameters[4]
-    v_min = parameters[2]
-    v_max = parameters[5]
+    v_max     = parameters[5]
 
-    # === 1) Find closest point on centerline ===
-    centerline = racetrack.centerline  # shape (N, 2)
-    diffs = centerline - np.array([sx, sy])
-    dists = np.linalg.norm(diffs, axis=1)
-    idx = np.argmin(dists)
+    centerline = racetrack.centerline
+    N = centerline.shape[0]
 
-    # Use the *next* point as our local target (like i+1 in the assignment).
-    # Wrap around to keep it on the track loop.
-    idx_next = (idx + 1) % centerline.shape[0]
+    # ---------- 1) Find closest centerline point ----------
+    car_pos = np.array([sx, sy])
+    dists   = np.linalg.norm(centerline - car_pos, axis=1)
+    idx     = int(np.argmin(dists))
 
-    target = centerline[idx_next]
-    dx = target[0] - sx
-    dy = target[1] - sy
+    # ---------- 2) Steering target: look ahead a few points ----------
+    idx_steer = (idx + STEER_LOOKAHEAD) % N
+    target    = centerline[idx_steer]
+    dx        = target[0] - sx
+    dy        = target[1] - sy
 
-    # === 2) Desired heading and steering angle reference (Q2) ===
-    # Desired heading from current position to next reference point
     phi_d = np.arctan2(dy, dx)
-
-    # Heading error, wrapped to [-pi, pi]
     e_phi = np.arctan2(np.sin(phi_d - phi), np.cos(phi_d - phi))
 
-    # Use linearized relation: phi_dot ≈ (v / lwb) * delta   (tan(delta) ≈ delta)
-    # Euler: phi[i+1] ≈ phi[i] + dt * (v / lwb) * delta_r
-    # Set phi[i+1] ≈ phi_d => delta_r ≈ (lwb / (v * dt)) * (phi_d - phi)
-    if abs(v) < 0.1:
-        # Avoid divide-by-zero at very low speed; just point wheels straight-ish
-        delta_r = 0.0
-    else:
-        delta_r = (lwb / (v * CONTROL_DT)) * e_phi
+    delta_r = K_HEADING * e_phi
 
-    # Clamp steering angle to physical limits
+    # soften demands at very low speed so we do not instantly saturate
+    if abs(v) < 1.0:
+        delta_r = np.clip(delta_r, -0.5, 0.5)
+
     delta_r = np.clip(delta_r, delta_min, delta_max)
 
-    # === 3) Velocity reference (Q3) ===
-    # Use speed = distance / time between successive centerline points.
-    # Approximate time step for the reference as CONTROL_DT.
-    segment = centerline[idx_next] - centerline[idx]
-    seg_dist = np.linalg.norm(segment)
+    # ---------- 3) Curvature-based velocity reference ----------
+    idx_prev = (idx - 1) % N
+    idx_next = (idx + 1) % N
 
-    if CONTROL_DT > 0:
-        v_r = seg_dist / CONTROL_DT
-    else:
-        v_r = v_max  # fallback, should not happen
+    seg_prev = centerline[idx]      - centerline[idx_prev]
+    seg_next = centerline[idx_next] - centerline[idx]
 
-    # Clamp to vehicle velocity limits
+    phi_prev = np.arctan2(seg_prev[1], seg_prev[0])
+    phi_next = np.arctan2(seg_next[1], seg_next[0])
+
+    dphi = np.arctan2(np.sin(phi_next - phi_prev), np.cos(phi_next - phi_prev))
+    dphi = abs(dphi)   # curvature proxy
+
+    # speeds
+    v_straight   = min(v_max, 50.0)  # high speed on straights
+    v_min_corner = 10.0              # low speed in very tight corners
+
+    # NEW: exponential mapping makes very sharp corners much slower
+    # dphi ≈ 0   -> curv_scale ≈ 1  (full straight speed)
+    # dphi ≈ 0.3 -> curv_scale ≈ exp(-6*0.09) ≈ 0.58
+    # dphi ≈ 0.7 -> curv_scale ≈ exp(-6*0.49) ≈ 0.05 (big slow-down)
+    curv_scale = np.exp(-6.0 * dphi * dphi)
+
+    v_r = v_min_corner + (v_straight - v_min_corner) * curv_scale
+
+    # clip within physical limits
     v_r = np.clip(v_r, v_min, v_max)
 
-    # You could also enforce a minimum forward speed if desired:
-    # v_r = max(v_r, 5.0)
+    # give a bit of push from rest so it starts moving
+    if v < 1.0:
+        v_r = max(v_r, 8.0)
 
     return np.array([delta_r, v_r])

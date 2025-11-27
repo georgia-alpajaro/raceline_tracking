@@ -120,38 +120,50 @@ def controller(
     dists   = np.linalg.norm(centerline - car_pos, axis=1)
     idx     = int(np.argmin(dists))
 
-    # ---------- 2) Compute curvature ahead of the car ----------
-    # Use three points (prev, curv, next) to approximate curvature.
-    idx_curv = (idx + 2) % N
-    idx_prev = (idx_curv - 1) % N
-    idx_next = (idx_curv + 1) % N
+    # ---------- 2) Curvature helper ----------
+    def curvature_at(i: int) -> float:
+        """Approximate |curvature| using three consecutive points."""
+        i = i % N
+        i_prev = (i - 1) % N
+        i_next = (i + 1) % N
 
-    p_prev = centerline[idx_prev]
-    p0     = centerline[idx_curv]
-    p_next = centerline[idx_next]
+        p_prev = centerline[i_prev]
+        p0     = centerline[i]
+        p_next = centerline[i_next]
 
-    a = np.linalg.norm(p0 - p_prev)
-    b = np.linalg.norm(p_next - p0)
-    c = np.linalg.norm(p_next - p_prev)
+        a = np.linalg.norm(p0 - p_prev)
+        b = np.linalg.norm(p_next - p0)
+        c = np.linalg.norm(p_next - p_prev)
 
-    if a > 1e-6 and b > 1e-6 and c > 1e-6:
-        # 2 * area of triangle = |cross(p0-p_prev, p_next-p_prev)|
-        area2 = abs(np.cross(p0 - p_prev, p_next - p_prev))
-        curvature = 2.0 * area2 / (a * b * c)  # |kappa|
-    else:
-        curvature = 0.0
+        if a > 1e-6 and b > 1e-6 and c > 1e-6:
+            # 2 * area of triangle = |cross(p0-p_prev, p_next-p_prev)|
+            area2 = abs(np.cross(p0 - p_prev, p_next - p_prev))
+            return 2.0 * area2 / (a * b * c)
+        else:
+            return 0.0
 
-    kappa = curvature
+    # ----- "Near" curvature: for steering / local shape -----
+    kappa_near = max(curvature_at(idx + 2), curvature_at(idx + 5))
 
-    # ---------- 3) Curvature-based velocity reference ----------
+    # ----- "Far" curvature: for speed / early braking -----
+    # Look further ahead to see clusters of sharp corners coming
+    kappa_far = 0.0
+    for offset in (5, 10, 15, 20):
+        kappa_far = max(kappa_far, curvature_at(idx + offset))
+
+    # If nothing sharp is ahead, fall back to local curvature
+    kappa = max(kappa_near, kappa_far)
+
+    # ---------- 3) Curvature-based velocity reference (use far curvature) ----------
     # Physics-ish: v_max(curvature) ~ sqrt(a_lat_max / |kappa|)
-    v_straight   = min(v_max, 60.0)  # high speed on straights
+    v_straight   = min(v_max, 65.0)  # fast on straights
     v_min_corner = 6.0               # crawl in the tightest corners
     a_lat_max    = 18.0              # "max lateral accel" (tuning knob)
 
     if kappa < 1e-6:
         v_curv = v_straight
     else:
+        # use far curvature so we start braking BEFORE we reach the tightest part
         v_curv = np.sqrt(a_lat_max / kappa)
 
     # clip into [v_min_corner, v_straight]
@@ -163,6 +175,7 @@ def controller(
     curv_scale = float(np.clip(curv_scale, 0.0, 1.0))
 
     # ---------- 4) Steering target & smoothed delta_r ----------
+    # Steering uses *near* geometry (we don't want to aim at a point 20 samples away)
     idx_steer = (idx + STEER_LOOKAHEAD) % N
     target    = centerline[idx_steer]
     dx        = target[0] - sx
@@ -171,7 +184,7 @@ def controller(
     phi_d = np.arctan2(dy, dx)
     e_phi = np.arctan2(np.sin(phi_d - phi), np.cos(phi_d - phi))
 
-    # Adaptive heading gain: smaller in sharp corners to reduce oscillation
+    # Adaptive heading gain: smaller when v_r is low (i.e., sharp corner)
     K_heading_eff = BASE_K_HEADING * (0.5 + 0.5 * curv_scale)
     raw_delta_r   = K_heading_eff * e_phi
 
@@ -179,9 +192,9 @@ def controller(
     if abs(v) < 1.0:
         raw_delta_r = np.clip(raw_delta_r, -0.5, 0.5)
 
-    # Adaptive smoothing: stronger smoothing (smaller alpha) in sharp corners
+    # Adaptive smoothing: more smoothing in sharper corners
     # curv_scale ~ 1 (straight) -> alpha ~ 0.9
-    # curv_scale ~ 0 (sharp)    -> alpha ~ 0.5
+    # curv_scale ~ 0 (hairpin / double sharp) -> alpha ~ 0.5
     alpha = 0.5 + 0.4 * curv_scale
 
     if not hasattr(controller, "delta_r_prev"):
